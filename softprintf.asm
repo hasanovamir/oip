@@ -1,5 +1,21 @@
 ;context switch
-;mov который кидает в массив и икрементит позицию
+;rdi = format str ptr;
+;rsi = agr_1
+;rdx = arg_2
+;rcx = arg_3
+;r8 = arg_4
+;r9 = arg_5
+;other arguments are contain in stack
+
+;r9  = the place on the stack where
+;the arguments are loaded by caller 
+;r11 = virtual stack for floats
+;r13 = printf`s str
+;r14 = print buffer size
+;r15 = num of float numbers
+;r12 = cur_arg = virtual stack pointer
+;that needs to access to stack, without 
+;destroying rsp
 
 global SoftPrintfTrampoline
 
@@ -10,9 +26,9 @@ section .data
 ;==============================================
 
     number_buffer      db 32 dup(0)
-    tmp_char           db 0
     ret_address        dq 0
     print_buffer       db 256 dup(0)
+    start_stack        dq 0
 
     undef_str db 'undefined symbol', 10
     ten_float dq 10.0
@@ -37,12 +53,86 @@ section .data
                            dq s_specifier
         times 'x'-'t'      dq undef_sym
                            dq x_specifier
-        times 128 -'y'     dq undef_sym
+        times 255 -'y'     dq undef_sym
 
 
 ;==============================================
 
 section .text
+
+;————————————————————————————————————————————————————————————————————————————————
+
+%macro  TAKE_CUR_F   0
+
+    cmp r15, 8
+    jb .from_register
+
+    cmp r12, [start_stack]
+    jae .take_from_cur_place
+
+    mov rbp, [start_stack]
+    movsd xmm0, [rbp + r11 * 8]
+    inc r11
+    jmp .end_f
+
+    .take_from_cur_place:
+
+        movsd xmm0, [r12]
+        add r12, 8
+        jmp .end_f
+
+    .from_register:
+
+        movsd xmm0, [r9 + 8 * r15]
+
+    .end_f:
+
+    inc r15
+
+%endmacro
+
+;————————————————————————————————————————————————————————————————————————————————
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+
+;enter  : al  = char
+;       : r14 = buffer size
+
+;return : -
+
+;destroy: rax, rdx, rsi, rdi, rcx
+;————————————————————————————————————————————————————————————————————————————————
+
+%macro ADD_CHAR_TO_BUFFER 0
+
+;rdi = print buffer ptr
+    mov rdi, print_buffer
+;add cur pos to start of array
+    add rdi, r14
+
+;mov char to buffer
+    mov [rdi], al
+;increase pos in print_buffer
+    inc r14
+
+;if buffer is full we should output it
+    cmp r14, 255
+    je .output
+
+    cmp al, 10
+    jne .end
+
+    .output:
+
+;print buffer content
+;destroy: rax, rdx, rsi, rdi
+        OUTPUT_BUFFER r14
+;clean buffer, make it zero size
+        xor r14, r14
+
+    .end:
+
+%endmacro
 
 ;————————————————————————————————————————————————————————————————————————————————
 ;use syscall function to print a string
@@ -59,66 +149,29 @@ section .text
 
 ;rbx = buffer pointer
     mov rbx, %1
-;rdi = print buffer ptr
-    mov rdi, print_buffer
-;add cur pos to start of array
-    add rdi, r14
-
 ;rcx = str_len
     mov rcx, %2
 
-    .pb_compare:
-
-;if buffer is full we should output it
-        cmp r14, 255
-        jne .add_to_buffer
-
-    .output:
-;save rcx, because syscall destroy it
+    .print_loop:
+;al = cur char
+        mov al, [rbx]
+;save rcx, because
+;ADD_CHAR_TO_BUFFER destroy it
         push rcx
-;print buffer content
-;destroy: rax, rdx, rsi, rdi
-        OUTPUT_BUFFER r14
+
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+;enter  : al  = char
+;       : r14 = buffer size
+;return : -
+;destroy: rax, rdx, rsi, rdi, rcx
+        ADD_CHAR_TO_BUFFER
+
 ;return rcx
         pop rcx
-;clean buffer, make it zero size
-        xor r14, r14
-;pos in printf buffer = 0
-        mov rdi, print_buffer
-;goto next compare if we have more symbols
-        cmp rcx, 0
-        jg .pb_compare
-;else go to end macro
-        jmp .end
-
-    .add_to_buffer:
-
-;al = cur_symbol
-        mov al, byte [rbx]
-        mov [rdi], al
-
 ;increase pos in src buffer
     inc rbx
-;increase pos in printf buffer
-    inc rdi
-;increase printf buffer size
-    inc r14
-;decrease num of iterations
-;use dec + cmp, because, if last symbol
-;is '\n', we goto .output there after 
-;output we jmp to compare, so we will don`t
-;change the rcx
-    dec rcx
-
-;if last sym == '\n' we goto output buffer
-    cmp al, 10
-    je .output
-
-;goto next compare
-        cmp rcx, 0
-        jg .pb_compare
-
-    .end:
+    loop .print_loop 
 
 %endmacro
 
@@ -319,6 +372,8 @@ SoftPrintfTrampoline:
 ;r9 = arg_5
 ;other arguments are contain in stack
 
+;r9  = the place on the stack where
+;the arguments are loaded by caller 
 ;r11 = virtual stack for floats
 ;r13 = printf`s str
 ;r14 = print buffer size
@@ -333,6 +388,9 @@ SoftPrintfTrampoline:
     pop rax
     mov [ret_address], rax
 
+;save stack before all pushes
+    mov [start_stack], rsp
+
 ;==============================================
 
 ;push arguments
@@ -346,9 +404,13 @@ SoftPrintfTrampoline:
 
     sub rsp, 8 * 8
 
-; there is no command push for xmm registers,
-; so we have to move them right to stack
-; movsd = move scalar double, which
+;r9 = label to access to xmm
+    mov r9, rsp
+    xor r11, r11
+
+;there is no command push for xmm registers,
+;so we have to move them right to stack
+;movsd = move scalar double, which
     movsd [rsp + 8 * 0], xmm0
     movsd [rsp + 8 * 1], xmm1
     movsd [rsp + 8 * 2], xmm2
@@ -396,6 +458,17 @@ end_soft_printf:
 
 ;==============================================
 
+;return destroy-free register
+
+    pop rbx
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+
+;==============================================
+
 ;return xmm values
     movsd xmm0, [rsp + 8 * 0]
     movsd xmm1, [rsp + 8 * 1]
@@ -407,17 +480,6 @@ end_soft_printf:
     movsd xmm7, [rsp + 8 * 7]
 
     add rsp, 8 * 8
-
-;==============================================
-
-;return destroy-free register
-
-    pop rbx
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
 
 ;==============================================
 
@@ -492,19 +554,14 @@ print_letter:
 
 ;take cur sym from format
     mov al, [r13]
-;put cur sym into variable, because print interrupt takes
-;str pointer, so we need our str in memory
-    mov byte [tmp_char], al
 
-;==============================================
-
-;use syscall function to print a string
-;enter  : 1 arg = buffer pointer
-;       : 2 arg = string length
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+;enter  : al  = char
+;       : r14 = buffer size
 ;return : -
-;destroy: rax, rdx, rsi, rdi
-
-    PRINT_STR tmp_char, 1
+;destroy: rax, rdx, rsi, rdi, rcx
+    ADD_CHAR_TO_BUFFER
 
 ;==============================================
 
@@ -523,7 +580,7 @@ specifier:
     movzx rax, byte [r13]
 ;rax *= 8, because it will use like pointer
     shl rax, 3
-
+------=-
     lea rdx, [rel specifier_jmp_table]
     add rdx, rax
     jmp [rdx]
@@ -543,19 +600,14 @@ c_specifier:
 ;take char to print
     mov rax, [r12]
     add r12, 8
-;put cur sym into variable, because print 
-;str pointer, so we need our str in memory
-    mov [tmp_char], al
 
-;==============================================
-
-;use syscall function to print a string
-;enter  : 1 arg = buffer pointer
-;       : 2 arg = string length
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+;enter  : al  = char
+;       : r14 = buffer size
 ;return : -
-;destroy: rax, rdx, rsi, rdi
-
-    PRINT_STR tmp_char, 1
+;destroy: rax, rdx, rsi, rdi, rcx
+    ADD_CHAR_TO_BUFFER
 
 ;==============================================
 
@@ -875,25 +927,7 @@ pointer_specifier:
 
 f_specifier:
 
-    jmp print_float
-
-    cmp r15, 8
-    jb take_from_start_stack
-
-;==============================================
-
-    movsd xmm0, [r12]
-    add r12, 8
-    jmp print_float
-
-;==============================================
-
-    take_from_start_stack:
-
-;xmm0 = cur float
-        movsd xmm0, [rsp + 8 * r15]
-        inc r15
-        jmp print_float
+    TAKE_CUR_F
 
 ;————————————————————————————————————————————————————————————————————————————————
 
@@ -915,8 +949,14 @@ print_float:
 
 ;==============================================
 
-    mov byte [tmp_char], '.'
-    PRINT_STR tmp_char, 1
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+;enter  : al  = char
+;       : r14 = buffer size
+;return : -
+;destroy: rax, rdx, rsi, rdi, rcx
+    mov al, '.'
+    ADD_CHAR_TO_BUFFER
 
 ;==============================================
 
@@ -932,8 +972,21 @@ print_float:
 
 ;==============================================
 
+;make an integer from fraction
     mulsd   xmm2, [ten_pow6]
     cvttsd2si rax, xmm2
+
+;==============================================
+
+    cmp rax, 0
+    jge positive_frac
+
+    neg rax
+
+;==============================================
+
+positive_frac:
+
     call ProcessInteger
 
 end_frac:
@@ -965,10 +1018,14 @@ ProcessInteger:
 ;save rax, because PRINT_STR destroys it
     push rax
 
-;PRINT_STR, takes str_ptr, str_len
-;destroy rax, rdx, rsi
-    mov [tmp_char], '-'
-    PRINT_STR tmp_char, 1
+;add char to print_buffer and dump
+;if we meet \n or buffer overflowed
+;enter  : al  = char
+;       : r14 = buffer size
+;return : -
+;destroy: rax, rdx, rsi, rdi, rcx
+    mov al, '-'
+    ADD_CHAR_TO_BUFFER
 
     pop rax
 
@@ -977,7 +1034,7 @@ ProcessInteger:
     int_positive_digit:
 
 ;rcx = num digits
-    xor rcx, rcx
+        xor rcx, rcx
 
     int_div_iter:
 
