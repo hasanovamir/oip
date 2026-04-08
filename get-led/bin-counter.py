@@ -22,13 +22,20 @@ def dec2bin(value):
 sleep_time = 0.2
 
 while True:
-    if GPIO.input(up):
+    up_st = GPIO.input(up)
+    down_st = GPIO.input(down)
+
+    if up_st and down_st:
+        num = 255
+        print(num, dec2bin(num))
+        time.sleep(sleep_time)
+    elif up_st:
         num += 1
         if (num > 255):
             num = 0
         print(num, dec2bin(num))
         time.sleep(sleep_time)
-    if GPIO.input(down):
+    elif down_st:
         num -= 1
         if (num < 0):
             num = 255
